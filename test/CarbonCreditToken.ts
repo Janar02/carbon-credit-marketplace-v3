@@ -3,18 +3,17 @@ import { ethers } from "hardhat";
 import { CarbonCreditToken, CarbonProjectRegistry } from "../typechain-types";
 
 describe("CarbonCreditToken", function() {
+    const initMintPct = 90;
     const projectId = 0;
     const ipfsCID = "Qm12345exampleCID";
-    const projectName = "Example Project";
     const uniqueVerificationId = "0000/2024";
-    const verifyingBodyNr = 0; // VCS aka Verra verifier
     const carbonRemoved = 100000;
-    const creditAmount = 1000;
 
     async function deployCarbonProjectRegistry() {
         const [admin, projectOwner] = await ethers.getSigners();
         const CarbonProjectRegistryFactory = await ethers.getContractFactory("CarbonProjectRegistry");
         const carbonProjectRegistry = await CarbonProjectRegistryFactory.deploy(
+            initMintPct,
             admin.address, 
             projectOwner.address
         ) as CarbonProjectRegistry;
@@ -38,15 +37,11 @@ describe("CarbonCreditToken", function() {
         it("Should succesfully mint tokens for project", async function () {
             const {carbonCreditToken, carbonProjectRegistry, admin, projectOwner} = await deployCarbonCreditToken();
 
-            const verifyingBody = await carbonProjectRegistry.convertToVerificationBody(verifyingBodyNr);
-
             // Call addProject from the projectOwner account
             await carbonProjectRegistry.connect(projectOwner).addProject(
-                ipfsCID, 
-                projectName, 
                 carbonRemoved,
+                ipfsCID,
                 uniqueVerificationId,
-                verifyingBody
             );
             
             // Accept project so we can mint tokens for it

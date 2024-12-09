@@ -16,12 +16,12 @@ contract CarbonCreditMarketplace is AccessControl {
 
     // Trade order structure
     struct TradeOrder {
+        bool isActive;
         address seller;
         uint256 projectId;
         uint256 totalAmount;      // Original total amount of credits
         uint256 remainingAmount;  // Amount still available for purchase
         uint256 pricePerCredit; // in wei
-        bool isActive;
     }
 
     // Mapping of order ID to Trade Order
@@ -30,8 +30,8 @@ contract CarbonCreditMarketplace is AccessControl {
 
     // Events for transparency
     event OrderCreated(
-        uint256 indexed orderId, 
         address indexed seller, 
+        uint256 indexed orderId, 
         uint256 projectId, 
         uint256 totalAmount,
         uint256 pricePerCredit
@@ -96,8 +96,8 @@ contract CarbonCreditMarketplace is AccessControl {
         });
 
         emit OrderCreated(
-            nextOrderId, 
             msg.sender, 
+            nextOrderId, 
             projectId, 
             amount, 
             pricePerCredit

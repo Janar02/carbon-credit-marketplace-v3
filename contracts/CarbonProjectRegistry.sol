@@ -8,15 +8,15 @@ contract CarbonProjectRegistry is AccessControl {
     bytes32 public constant PROJECT_OWNER_ROLE = keccak256("PROJECT_OWNER_ROLE");
 
     struct ProjectMetadata {
-        string ipfsCID;
-        string projectName;
-        address projectOwner;
         ProjectStatus status;
+        // Verifier verifierBody; Move inside ipfs
+        bytes32 uniqueVerificationId;
+        address projectOwner;
         uint256 authenticationDate;
         uint256 carbonRemoved;
         uint256 creditsIssued;
-        string uniqueVerificationId;
-        VerificationBodies verifier;
+        string ipfsCID;
+        // string projectName; Move inside ipfs
     }
 
     enum ProjectStatus {
@@ -25,69 +25,48 @@ contract CarbonProjectRegistry is AccessControl {
         Rejected
     }
 
-    enum VerificationBodies{
-        VCS, // aka Verra
-        Gold_Standard,
-        CAR,
-        ACR
-    }
-    uint8 VerificationBodiesCount = 4;
-
     mapping(uint256 => ProjectMetadata) public projects;
     uint256 private projectCount;
 
-    mapping(bytes32 => bool) public registeredProjects;
+    mapping(bytes32 => bool) private registeredProjects;
     
-    uint8 public creditRiskBuffer = 10; // 10% of credits are withheld to assure environmental integrity
+    uint8 public immutable mintPercentage; // 10% of credits are withheld to assure environmental integrity
 
-    constructor(address defaultAdmin, address defaultProjectOwner) {
+    constructor(uint8 _percentageToBeMinted, address defaultAdmin, address defaultProjectOwner) {
         _grantRole(DEFAULT_ADMIN_ROLE, defaultAdmin);
         _grantRole(AUDITOR_ROLE, defaultAdmin);
         _grantRole(PROJECT_OWNER_ROLE, defaultProjectOwner);
+        mintPercentage = _percentageToBeMinted;
     }
 
     event ProjectAdded(
+        address indexed projectOwner,
         uint256 indexed projectId,
-        string ipfsCID,
-        string projectName,
         uint256 carbonRemoved,
-        address indexed projectOwner
+        string ipfsCID
     );
 
-    function updateProjectRegistration(bytes32 projectHash, bool isRegistered) private {
-        registeredProjects[projectHash] = isRegistered;
-    }
-
-    function convertToVerificationBody(uint8 _bodyIndex) public view returns (VerificationBodies) {
-        require(_bodyIndex < VerificationBodiesCount, "Invalid verification body index");
-        return VerificationBodies(_bodyIndex);
-    }
-
     function addProject(
-        string memory _ipfsCID, 
-        string memory _projectName,
         uint256 _carbonRemoved,
-        string memory _uniqueVerificationId,
-        VerificationBodies _verifier
+        string memory _ipfsCID,
+        string memory _uniqueVerificationId
     ) 
         external
         onlyRole(PROJECT_OWNER_ROLE) 
     {
-        bytes32 projectHash = keccak256((abi.encodePacked(bytes(_uniqueVerificationId), bytes(_projectName), _verifier)));
+        bytes32 projectHash = keccak256(bytes(_uniqueVerificationId));
         require(!registeredProjects[projectHash], "This project already exists!");
         projects[projectCount] = ProjectMetadata({
-            ipfsCID: _ipfsCID,
-            projectName: _projectName,
-            projectOwner: msg.sender,
             status: ProjectStatus.Pending,
+            ipfsCID: _ipfsCID,
+            projectOwner: msg.sender,
             authenticationDate: 0,
             carbonRemoved: _carbonRemoved,
-            uniqueVerificationId: _uniqueVerificationId,
-            verifier: _verifier,
+            uniqueVerificationId: projectHash,
             creditsIssued: 0
         });
-        updateProjectRegistration(projectHash, true);
-        emit ProjectAdded(projectCount, _ipfsCID, _projectName, _carbonRemoved, msg.sender);
+        registeredProjects[projectHash] = true;
+        emit ProjectAdded(msg.sender, projectCount, _carbonRemoved, _ipfsCID);
         projectCount++;
     }
 
@@ -109,7 +88,7 @@ contract CarbonProjectRegistry is AccessControl {
     }
 
     function getRiskCorrectedCreditAmount(uint256 amount) private view returns(uint256) {
-        return amount - amount * creditRiskBuffer / 100;
+        return amount * mintPercentage / 100;
     }
 
     function acceptProject(uint256 _projectId) public onlyRole(AUDITOR_ROLE) {
@@ -123,15 +102,11 @@ contract CarbonProjectRegistry is AccessControl {
         updateProjectStatus(_projectId, ProjectStatus.Rejected);
     }
 
-    function projectExists(uint256 id) public view returns(bool) {
-        bytes32 projectHash = keccak256((
-            abi.encodePacked(
-                bytes(projects[id].uniqueVerificationId), 
-                bytes(projects[id].projectName), 
-                projects[id].verifier
-            )
-        ));
-        return registeredProjects[projectHash];
+    function projectExists(uint256 id) public view returns (bool) {
+        bytes32 _uniqueVerificationId = projects[id].uniqueVerificationId;
+        if (_uniqueVerificationId == 0)
+            return false;
+        return registeredProjects[_uniqueVerificationId];
     }
 
     function getProjectIssuedCredits(uint256 projectId) public view returns(uint256) {

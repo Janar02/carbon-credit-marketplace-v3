@@ -18,11 +18,10 @@ describe("CarbonCreditMarketplace", function () {
   let auditor: SignerWithAddress;
 
   // Project and credit details
+  const initMintPct = 90;
   const projectId = 0;
   const ipfsCID = "Qm12345exampleCID";
-  const projectName = "Example Carbon Project";
   const uniqueVerificationId = "0000/2024";
-  const verifyingBodyNr = 0; // VCS aka Verra verifier
   const carbonRemoved = 500000;
 
   // Deployment helper function
@@ -31,7 +30,7 @@ describe("CarbonCreditMarketplace", function () {
 
     // Deploy Project Registry
     const ProjectRegistryFactory = await ethers.getContractFactory("CarbonProjectRegistry");
-    projectRegistry = await ProjectRegistryFactory.deploy(owner.address, seller.address);
+    projectRegistry = await ProjectRegistryFactory.deploy(initMintPct, owner.address, seller.address);
 
     // Deploy Carbon Credit Token
     const CarbonTokenFactory = await ethers.getContractFactory("CarbonCreditToken");
@@ -48,17 +47,12 @@ describe("CarbonCreditMarketplace", function () {
       await projectRegistry.getAddress(), 
       owner.address
     );
-
-    // Setup project and mint credits
-    const verifyingBody = await projectRegistry.convertToVerificationBody(verifyingBodyNr);
     
     // Add project as seller
     await projectRegistry.connect(seller).addProject(
-      ipfsCID, 
-      projectName, 
       carbonRemoved,
+      ipfsCID,
       uniqueVerificationId, 
-      verifyingBody
     );
 
     // Approve and mint credits by auditor
