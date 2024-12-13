@@ -6,6 +6,7 @@ import "@openzeppelin/contracts/access/AccessControl.sol";
 contract CarbonProjectRegistry is AccessControl {
     bytes32 public constant AUDITOR_ROLE = keccak256("AUDITOR_ROLE");
     bytes32 public constant PROJECT_OWNER_ROLE = keccak256("PROJECT_OWNER_ROLE");
+    uint8 public immutable mintPercentage;
 
     struct ProjectMetadata {
         ProjectStatus status;
@@ -29,8 +30,6 @@ contract CarbonProjectRegistry is AccessControl {
     uint256 private projectCount;
 
     mapping(bytes32 => bool) private registeredProjects;
-    
-    uint8 public immutable mintPercentage; // 10% of credits are withheld to assure environmental integrity
 
     constructor(uint8 _percentageToBeMinted, address defaultAdmin, address defaultProjectOwner) {
         _grantRole(DEFAULT_ADMIN_ROLE, defaultAdmin);
@@ -39,81 +38,98 @@ contract CarbonProjectRegistry is AccessControl {
         mintPercentage = _percentageToBeMinted;
     }
 
-    event ProjectAdded(
-        address indexed projectOwner,
-        uint256 indexed projectId,
-        uint256 carbonRemoved,
-        string ipfsCID
-    );
-
     function addProject(
-        uint256 _carbonRemoved,
-        string memory _ipfsCID,
-        string memory _uniqueVerificationId
+        uint256 _carbonReduction,
+        string calldata _ipfsCID,
+        string calldata _verificationId
     ) 
         external
         onlyRole(PROJECT_OWNER_ROLE) 
     {
-        bytes32 projectHash = keccak256(bytes(_uniqueVerificationId));
-        require(!registeredProjects[projectHash], "This project already exists!");
+        bytes32 projectHash = keccak256(bytes(_verificationId)); // could be done offchain maybe?
+        if(registeredProjects[projectHash]) revert ProjectAlreadyExists(_verificationId);
+        if(_carbonReduction == 0) revert InvalidReductionAmount(_carbonReduction);
         projects[projectCount] = ProjectMetadata({
             status: ProjectStatus.Pending,
             ipfsCID: _ipfsCID,
             projectOwner: msg.sender,
             authenticationDate: 0,
-            carbonRemoved: _carbonRemoved,
+            carbonRemoved: _carbonReduction,
             uniqueVerificationId: projectHash,
             creditsIssued: 0
         });
         registeredProjects[projectHash] = true;
-        emit ProjectAdded(msg.sender, projectCount, _carbonRemoved, _ipfsCID);
+        emit ProjectAdded(msg.sender, projectCount, _carbonReduction, _ipfsCID);
         projectCount++;
     }
 
-    function updateProjectMetaData(uint256 projectId, string memory _newIpfsCID) 
+    function updateProjectMetaData(uint256 _projectId, string calldata _newIpfsCID) 
         external 
-        onlyRole(PROJECT_OWNER_ROLE)
     {
-        require(projectExists(projectId), "Project does not exist");
-        require(projects[projectId].projectOwner == msg.sender, "You are not authorized to update the project");
-        require(projects[projectId].status == ProjectStatus.Rejected || projects[projectId].status == ProjectStatus.Pending, "Project cannot be updated");
-        
-        projects[projectId].ipfsCID = _newIpfsCID;
-        projects[projectId].status = ProjectStatus.Pending;
+        if(!hasRole(PROJECT_OWNER_ROLE, msg.sender) && !hasRole(AUDITOR_ROLE, msg.sender)){
+            bytes32[2] memory requiredRoles = [PROJECT_OWNER_ROLE, AUDITOR_ROLE];
+            revert UnauthorizedAccount(address(msg.sender), requiredRoles);
+        }
+        if(!projectExists(_projectId)) 
+            revert ProjectNotFound();
+        // Additional checks for Project Owners
+        if(!hasRole(AUDITOR_ROLE, msg.sender)){
+            if(projects[_projectId].projectOwner != msg.sender)
+                revert NotProjectOwner();
+            if(projects[_projectId].status == ProjectStatus.Audited) 
+                revert ProjectAlreadyAudited();
+        }
+        projects[_projectId].ipfsCID = _newIpfsCID;
+        projects[_projectId].status = ProjectStatus.Pending;
     }
 
-    function updateProjectStatus(uint256 _projectId, ProjectStatus _newStatus) private {
-        projects[_projectId].status = _newStatus;
-        projects[_projectId].authenticationDate = block.timestamp;
-    }
-
-    function getRiskCorrectedCreditAmount(uint256 amount) private view returns(uint256) {
+    function getRiskCorrectedCreditAmount(uint256 amount) internal view returns(uint256) {
         return amount * mintPercentage / 100;
     }
 
     function acceptProject(uint256 _projectId) public onlyRole(AUDITOR_ROLE) {
-        require(projectExists(_projectId), "Project does not exist");
-        updateProjectStatus(_projectId, ProjectStatus.Audited);
+        if(!projectExists(_projectId))
+            revert ProjectNotFound();
+        projects[_projectId].status = ProjectStatus.Audited;
+        projects[_projectId].authenticationDate = block.timestamp;
         projects[_projectId].creditsIssued = getRiskCorrectedCreditAmount(projects[_projectId].carbonRemoved);
     }
     
     function rejectProject(uint256 _projectId) public onlyRole(AUDITOR_ROLE) {
-        require(projectExists(_projectId), "Project does not exist");
-        updateProjectStatus(_projectId, ProjectStatus.Rejected);
+        if(!projectExists(_projectId))
+            revert ProjectNotFound();
+        if(projects[_projectId].status == ProjectStatus.Audited)
+            revert ProjectAlreadyAudited();
+        projects[_projectId].status = ProjectStatus.Rejected;
     }
 
-    function projectExists(uint256 id) public view returns (bool) {
-        bytes32 _uniqueVerificationId = projects[id].uniqueVerificationId;
+    function projectExists(uint256 _projectId) public view returns (bool) {
+        bytes32 _uniqueVerificationId = projects[_projectId].uniqueVerificationId;
         if (_uniqueVerificationId == 0)
             return false;
         return registeredProjects[_uniqueVerificationId];
     }
 
-    function getProjectIssuedCredits(uint256 projectId) public view returns(uint256) {
-        return projects[projectId].creditsIssued;
+    function getProjectIssuedCredits(uint256 _projectId) public view returns(uint256) {
+        return projects[_projectId].creditsIssued;
     }
 
-    function isProjectAudited(uint256 projectId) public view returns(bool) {
-        return projects[projectId].status == ProjectStatus.Audited;
-    }
+    // function isProjectAudited(uint256 projectId) public view returns(bool) {
+    //     return projects[projectId].status == ProjectStatus.Audited;
+    // }
+
+        
+    error InvalidReductionAmount(uint256 carbonReduced);
+    error NotProjectOwner();
+    error ProjectAlreadyExists(string verificationId);
+    error ProjectAlreadyAudited();
+    error ProjectNotFound();
+    error UnauthorizedAccount(address account, bytes32[2] neededRoles);
+
+    event ProjectAdded(
+        address indexed projectOwner,
+        uint256 indexed projectId,
+        uint256 carbonReduced,
+        string ipfsCID
+    );
 }

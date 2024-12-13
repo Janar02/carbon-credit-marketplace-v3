@@ -1,14 +1,24 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.22;
 
-import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./CarbonCreditToken.sol";
 import "./CarbonProjectRegistry.sol";
 
-contract CarbonCreditMarketplace is AccessControl {
-    // Define roles for marketplace management
-    bytes32 public constant MARKETPLACE_ADMIN_ROLE = keccak256("MARKETPLACE_ADMIN_ROLE");
+contract CarbonCreditMarketplace is Ownable, ReentrancyGuard, ERC1155Holder  {
+    
+    bool public marketplacePaused;
+    uint16 public platformFeeBasisPoints = 120; // 1.2% initially
+    uint16 private constant BIPS_DENOMINATOR = 10000; // platform fee can display % with 2 decimal places
+    uint256 private constant ORDER_EXPIRATION_PERIOD = 7 days;
+
+    // Modifier to restrict functions to when marketplace is not paused
+    modifier whenNotPaused() {
+        require(!marketplacePaused, "Trading is paused");
+        _;
+    }
 
     // Contracts we'll interact with
     CarbonCreditToken public carbonToken;
@@ -19,141 +29,175 @@ contract CarbonCreditMarketplace is AccessControl {
         bool isActive;
         address seller;
         uint256 projectId;
-        uint256 totalAmount;      // Original total amount of credits
-        uint256 remainingAmount;  // Amount still available for purchase
-        uint256 pricePerCredit; // in wei
+        uint256 creditsAmount;     // Total amount of credits
+        uint256 orderPrice;         // in wei
+        uint256 expirationTimestamp;
     }
 
     // Mapping of order ID to Trade Order
     mapping(uint256 => TradeOrder) public tradeOrders;
-    uint256 public nextOrderId;
-
-    // Events for transparency
-    event OrderCreated(
-        address indexed seller, 
-        uint256 indexed orderId, 
-        uint256 projectId, 
-        uint256 totalAmount,
-        uint256 pricePerCredit
-    );
-
-    event PartialOrderFilled(
-        uint256 indexed orderId, 
-        address indexed buyer, 
-        address indexed seller,
-        uint256 amountFilled, 
-        uint256 totalPaid
-    );
-
-    event OrderFullyExecuted(
-        uint256 indexed orderId, 
-        address indexed buyer
-    );
-
-    event OrderCancelled(uint256 indexed orderId);
+    uint256 internal nextOrderId;
 
     constructor(
         address _carbonTokenAddress, 
         address _projectRegistryAddress,
-        address _marketplaceAdmin
-    ) {
+        address _initialOwner
+    ) Ownable(_initialOwner){
         carbonToken = CarbonCreditToken(_carbonTokenAddress);
         projectRegistry = CarbonProjectRegistry(_projectRegistryAddress);
-        
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(MARKETPLACE_ADMIN_ROLE, _marketplaceAdmin);
-        
-        nextOrderId = 1;
+    }
+    
+    function updatePlatformFee(uint16 newFeeBasisPoints) external onlyOwner {
+        require(newFeeBasisPoints <= 1000, "Fee cannot exceed 10%");
+        platformFeeBasisPoints = newFeeBasisPoints;
+        emit PlatformFeeUpdated(newFeeBasisPoints);
+    }
+
+    function toggleMarketplacePause() external onlyOwner {
+        marketplacePaused = !marketplacePaused;
+        emit MarketplacePauseStatusChanged(marketplacePaused);
     }
 
     // Create a sell order for carbon credits
     function createSellOrder(
-        uint256 projectId, 
-        uint256 amount, 
-        uint256 pricePerCredit
-    ) external {
-        // Verify project exists and is audited
-        require(
-            projectRegistry.projectExists(projectId) && 
-            projectRegistry.isProjectAudited(projectId), 
-            "Invalid or non-audited project"
-        );
+        uint256 _projectId, 
+        uint256 _amount, 
+        uint256 _pricePerCredit
+    ) external whenNotPaused {
+        if(!carbonToken.isApprovedForAll(msg.sender, address(this))) 
+            revert TransferNotApproved();
+        if(_pricePerCredit == 0) 
+            revert InvalidPrice(_pricePerCredit);
+        if(_amount > carbonToken.balanceOf(msg.sender, _projectId)) 
+            revert InsufficientBalance(_amount);
+        uint256 orderId = nextOrderId++;
 
-        // Check seller owns and approves the tokens
-        require(
-            carbonToken.balanceOf(msg.sender, projectId) >= amount, 
-            "Insufficient token balance"
-        );
+        // Transfer tokens to this address
+        carbonToken.safeTransferFrom(msg.sender, address(this), _projectId, _amount, "");
 
-        // Create trade order
-        tradeOrders[nextOrderId] = TradeOrder({
-            seller: msg.sender,
-            projectId: projectId,
-            totalAmount: amount,
-            remainingAmount: amount,
-            pricePerCredit: pricePerCredit,
-            isActive: true
-        });
+        unchecked{
+            uint256 totalPrice = _amount * _pricePerCredit;
 
-        emit OrderCreated(
-            msg.sender, 
-            nextOrderId, 
-            projectId, 
-            amount, 
-            pricePerCredit
-        );
+            // Create trade order
+            tradeOrders[orderId] = TradeOrder({
+                seller: msg.sender,
+                projectId: _projectId,
+                creditsAmount: _amount,
+                orderPrice: totalPrice,
+                isActive: true,
+                expirationTimestamp: block.timestamp + ORDER_EXPIRATION_PERIOD
+            });
 
-        nextOrderId++;
+            emit OrderCreated(
+                orderId, 
+                msg.sender, 
+                _projectId, 
+                _amount, 
+                totalPrice
+            );
+        }
     }
 
     // Execute a trade order
-    function executeTrade(uint256 orderId, uint256 requestedAmount) external payable {
-        TradeOrder storage order = tradeOrders[orderId];
+    function executeTrade(uint256 _orderId) external payable whenNotPaused nonReentrant {        
+        TradeOrder memory order = tradeOrders[_orderId];        
+        // Initial checks
+        if(!order.isActive || checkOrderExpiration(_orderId)) revert InactiveOrder(_orderId);
+        if(msg.value < order.orderPrice) revert InsufficientPayment();
         
-        require(order.isActive, "Order is not active");        
-        require(requestedAmount > 0, "Cannot purchase zero credits");
-        require(requestedAmount <= order.remainingAmount, "Requested amount exceeds available credits");
+        // Calculate platform fee and seller proceeds
+        uint256 platformFee = order.orderPrice * platformFeeBasisPoints / BIPS_DENOMINATOR;
+        uint256 sellerProceeds = order.orderPrice - platformFee;
 
-        // Calculate marketplace fee
-        uint256 totalPrice = requestedAmount * order.pricePerCredit;
-        require(msg.value >= totalPrice, "Insufficient payment");
+        // Transfer credits from contract to buyer
+        carbonToken.safeTransferFrom(address(this), msg.sender, _orderId, order.creditsAmount, "");
 
-        // Transfer carbon credits
-        carbonToken.safeTransferFrom(
-            order.seller, 
-            msg.sender, 
-            order.projectId, 
-            order.totalAmount, 
-            ""
-        );
+        // Pay credit seller
+        (bool sellerSent,) = payable(order.seller).call{value: sellerProceeds}("");
+        (bool feeSent,) = payable(owner()).call{value: platformFee}("");
+        if (!sellerSent || !feeSent) revert TransferFailed();
 
-        // Send payment to seller
-        payable(order.seller).transfer(totalPrice);
-
-        // update order details
-        order.remainingAmount -= requestedAmount;
-
-        // Emit appropriate event
-        if(order.remainingAmount == 0){
-            order.isActive = false;
-            emit OrderFullyExecuted(orderId, msg.sender);
-        }else{
-            emit PartialOrderFilled(orderId, msg.sender, order.seller, requestedAmount, totalPrice);
+        // Refund excess
+        uint256 refundAmount = msg.value - order.orderPrice;
+        if (refundAmount > 0) {
+            (bool refundSent,) = payable(msg.sender).call{value: refundAmount}("");
+            if (!refundSent) revert RefundFailed();
         }
 
-        // Refund any excess payment
-        if (msg.value > totalPrice) {
-            payable(msg.sender).transfer(msg.value - totalPrice);
-        }
+        tradeOrders[_orderId].isActive = false;
+        tradeOrders[_orderId].expirationTimestamp = 0;
+        // emit event
+        emit OrderFilled(msg.sender, order.seller, _orderId, order.creditsAmount, order.orderPrice);
     }
 
     // Cancel an existing sell order
-    function cancelSellOrder(uint256 orderId) external {
-        TradeOrder storage order = tradeOrders[orderId];
-        require(order.seller == msg.sender, "Not order owner");
-        require(order.isActive, "Order already inactive");
-
-        order.isActive = false;
-        emit OrderCancelled(orderId);
+    function removeSellOrder(uint256 _orderId) external whenNotPaused {
+        TradeOrder memory order = tradeOrders[_orderId];
+        if(!order.isActive) revert InactiveOrder(_orderId);
+        if(order.seller != msg.sender) revert NotOrderOwner();
+        closeOrder(_orderId);        
+        emit OrderClosed(_orderId, msg.sender, order.projectId, order.creditsAmount, order.orderPrice);
     }
+
+    function checkOrderExpiration(uint256 _orderId) public returns(bool){
+        TradeOrder memory order = tradeOrders[_orderId];
+        if(order.isActive && block.timestamp > order.expirationTimestamp){
+            closeOrder(_orderId);
+            emit OrderExpired(_orderId, order.seller, order.projectId, order.creditsAmount, order.orderPrice);
+            return true;
+        }
+        emit OrderNotExpired(_orderId);
+        return false;
+    }
+
+    function closeOrder(uint256 _orderId) private {
+        tradeOrders[_orderId].isActive = false;
+        tradeOrders[_orderId].expirationTimestamp = 0;
+        address seller = tradeOrders[_orderId].seller;
+        uint256 credits = tradeOrders[_orderId].creditsAmount;
+        carbonToken.safeTransferFrom(address(this), seller, _orderId, credits, "");
+    }
+    
+    error InactiveOrder(uint256 orderId);
+    error InsufficientBalance(uint256 amount);
+    error InsufficientPayment();
+    error InvalidAmount(uint256 amount);
+    error InvalidPrice(uint256 price);
+    error NotOrderOwner();
+    error RefundFailed();
+    error TradingIsPaused();
+    error TransferFailed();
+    error TransferNotApproved();
+
+    event MarketplacePauseStatusChanged(bool isPaused);
+    event OrderCreated(
+        uint256 indexed orderId, 
+        address indexed seller, 
+        uint256 indexed projectId, 
+        uint256 creditsAmount,
+        uint256 orderPrice
+    );
+    event OrderFilled(
+        address indexed buyer, 
+        address indexed seller,
+        uint256 indexed orderId, 
+        uint256 amountFilled, 
+        uint256 totalPrice
+    );
+    event OrderClosed(
+        uint256 indexed orderId, 
+        address indexed closedBy, 
+        uint256 indexed projectId, 
+        uint256 creditsAmount,
+        uint256 orderPrice 
+    );
+    event OrderExpired(
+        uint256 indexed orderId, 
+        address indexed seller, 
+        uint256 indexed projectId, 
+        uint256 creditsAmount,
+        uint256 orderPrice 
+    );
+    event OrderNotExpired(uint256 orderId);
+    event PlatformFeeUpdated(uint256 newFeeBasisPoints);
 }
