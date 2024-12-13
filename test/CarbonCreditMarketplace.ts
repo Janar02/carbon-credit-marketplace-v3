@@ -22,14 +22,17 @@ describe("CarbonCreditMarketplace", function () {
   const orderCreatedEvent = "OrderCreated";
   const orderClosedEvent = "OrderClosed";
   const orderExpiredEvent = "OrderExpired";
+  const orderFilledEvent = "OrderFilled";
   const orderNotExpiredEvent = "OrderNotExpired";
   const togglePauseEvent = "MarketplacePauseStatusChanged";
   const updateFeeEvent = "PlatformFeeUpdated";
 
   const insufficientBalanceError = "InsufficientBalance";
   const inactiveOrderError = "InactiveOrder";
+  const insufficientPaymentError = "InsufficientPayment";
   const invalidPriceError = "InvalidPrice";
   const notOrderOwnerError = "NotOrderOwner";
+  const orderInactiveError = "InactiveOrder";
   const transferNotApprocedError = "TransferNotApproved";
 
 
@@ -204,7 +207,6 @@ describe("CarbonCreditMarketplace", function () {
     const sellAmount = BigInt(300);
     const sellPricePerCredit = ethers.parseEther("0.1");
     const totalSellPrice = sellAmount * sellPricePerCredit;
-    console.log(totalSellPrice);
 
     beforeEach(async function () {
       // Create sell order
@@ -299,82 +301,59 @@ describe("CarbonCreditMarketplace", function () {
       expect(result).to.emit(marketplace, orderNotExpiredEvent)
     });
   });
-  // describe("Trade Execution", function () {
-  //   let orderId: bigint;
 
-  //   beforeEach(async function () {
-  //     // Approve marketplace to spend tokens
-  //     await carbonToken.connect(seller).setApprovalForAll(await marketplace.getAddress(), true);
+  describe("Trade Execution", function () {
+    const orderId = 0;
+    const orderAmount = 250;
+    const pricePerCredit = ethers.parseEther("10");
+    const orderTotalPrice = BigInt(orderAmount) * pricePerCredit;
 
-  //     // Create sell order
-  //     await marketplace.connect(seller).createSellOrder(
-  //       projectId, 
-  //       300, 
-  //       ethers.parseEther("0.1")
-  //     );
-  //     orderId = 1n;
-  //   });
+    beforeEach(async function () {
+      // Approve marketplace to spend tokens
+      await carbonToken.connect(seller).setApprovalForAll(await marketplace.getAddress(), true);
 
-  //   it("Should execute a full trade successfully", async function () {
-  //     const initialSellerBalance = await ethers.provider.getBalance(seller.address);
-  //     const tradeAmount = 300;
-  //     const totalPrice = tradeAmount * Number(ethers.parseEther("0.1"));
+      // Create sell order
+      await marketplace.connect(seller).createSellOrder(
+        projectId, 
+        orderAmount, 
+        pricePerCredit
+      );
+    });
 
-  //     await expect(
-  //       marketplace.connect(buyer).executeTrade(orderId, tradeAmount, {
-  //         value: ethers.parseEther(String(totalPrice / 1e18))
-  //       })
-  //     ).to.emit(marketplace, "OrderFullyExecuted")
-  //       .withArgs(orderId, buyer.address);
+    it("Should execute a full trade successfully", async function () {
+      const initialSellerBalance = await ethers.provider.getBalance(seller.address);
+      
+      // Check event emission
+      await expect(
+        marketplace.connect(buyer).executeTrade(orderId, {value: orderTotalPrice})
+      ).to.emit(marketplace, orderFilledEvent).withArgs(buyer.address, seller.address, projectId, orderAmount, orderTotalPrice);
 
-  //     // Verify token transfer
-  //     const buyerBalance = await carbonToken.balanceOf(buyer.address, projectId);
-  //     expect(buyerBalance).to.equal(tradeAmount);
+      // Verify token transfer
+      const buyerBalance = await carbonToken.balanceOf(buyer.address, projectId);
+      expect(buyerBalance).to.equal(orderAmount);
 
-  //     // Verify seller received payment
-  //     const finalSellerBalance = await ethers.provider.getBalance(seller.address);
-  //     expect(finalSellerBalance).to.equal(initialSellerBalance + BigInt(totalPrice));
-  //   });
+      // Verify seller received payment
+      const finalSellerBalance = await ethers.provider.getBalance(seller.address);
+      const feePercentage = await marketplace.platformFeeBasisPoints();
+      const sellerProceeds = orderTotalPrice - orderTotalPrice * feePercentage / BigInt(10000);
+      // console.log(`Seller init balance: ${initialSellerBalance}, Sell price: ${orderTotalPrice}, proceeds: ${sellerProceeds}`);
+      expect(finalSellerBalance).to.equal(initialSellerBalance + sellerProceeds);
+    });
 
-  //   it("Should allow partial order fills", async function () {
-  //     const partialAmount = BigInt(100);
-  //     const totalPrice = partialAmount * BigInt(Number(ethers.parseEther("0.1")));
+    it("Should prevent trading on an inactive order", async function () {
+      // Cancel the order first
+      await marketplace.connect(seller).removeSellOrder(orderId);
+    
+      await expect(
+        marketplace.connect(buyer).executeTrade(orderId, { value: ethers.parseEther("0.001") })
+      ).to.be.revertedWithCustomError(marketplace, orderInactiveError);
+    });
 
-  //     await expect(
-  //       marketplace.connect(buyer).executeTrade(orderId, partialAmount, {
-  //         value: ethers.parseEther(String(totalPrice / BigInt(1e18)))
-  //       })
-  //     ).to.emit(marketplace, "PartialOrderFilled")
-  //       .withArgs(
-  //         orderId, 
-  //         buyer.address, 
-  //         seller.address,
-  //         partialAmount, 
-  //         totalPrice
-  //       );
+    it("Should prevent trading more credits than available", async function () {
+      await expect(
+        marketplace.connect(buyer).executeTrade(orderId, { value: orderTotalPrice - BigInt(200) })
+      ).to.be.revertedWithCustomError(marketplace, insufficientPaymentError);
+    });
 
-  //     // Check remaining amount
-  //     const order = await marketplace.tradeOrders(orderId);
-  //     expect(order.remainingAmount).to.equal(200);
-  //   });
-
-  //   it("Should prevent trading more credits than available", async function () {
-  //     await expect(
-  //       marketplace.connect(buyer).executeTrade(orderId, 400, {
-  //         value: ethers.parseEther("40")
-  //       })
-  //     ).to.be.revertedWith("Requested amount exceeds available credits");
-  //   });
-
-  //   it("Should prevent trading on an inactive order", async function () {
-  //     // Cancel the order first
-  //     await marketplace.connect(seller).cancelSellOrder(orderId);
-
-  //     await expect(
-  //       marketplace.connect(buyer).executeTrade(orderId, 100, {
-  //         value: ethers.parseEther("10")
-  //       })
-  //     ).to.be.revertedWith("Order is not active");
-  //   });
-  // });
+  });
 });
