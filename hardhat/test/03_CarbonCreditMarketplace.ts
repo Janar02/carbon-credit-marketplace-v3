@@ -215,7 +215,7 @@ describe("CarbonCreditMarketplace", function () {
           projectId, 
           carbonRemoved, 
           ethers.parseEther("0.1")
-        )).to.be.rejectedWith("Trading is paused");
+        )).to.be.revertedWith("Trading is paused");
     });
   });
   
@@ -348,8 +348,8 @@ describe("CarbonCreditMarketplace", function () {
 
     it("Should batch close multiple expired orders", async function () {
       // Create multiple orders
-      const orderIds = [];
-      for (let i = 0; i < 3; i++) {
+      const orderIds: number[] = [];
+      for (let i:number = 0; i < 3; i++) {
         await marketplace.connect(seller).createSellOrder(
           projectId, 
           100, 

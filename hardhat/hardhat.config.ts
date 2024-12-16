@@ -12,7 +12,11 @@ const config: HardhatUserConfig = {
     },
   },  
   
-  defaultNetwork: "running",
+  // To run tests
+  // defaultNetwork: "hardhat",
+
+  // To connect to smart contracts
+  defaultNetwork: "harhdat",
 
   networks: {
     hardhat: {
