@@ -21,7 +21,7 @@ describe("CarbonCreditMarketplace", function () {
 
   const orderCreatedEvent = "OrderCreated";
   const orderClosedEvent = "OrderClosed";
-  const orderExpiredEvent = "OrderExpired";
+  const expiredOrderClosedEvent = "ExpiredOrderClosed";
   const orderFilledEvent = "OrderFilled";
   const orderNotExpiredEvent = "OrderNotExpired";
   const togglePauseEvent = "MarketplacePauseStatusChanged";
@@ -68,14 +68,12 @@ describe("CarbonCreditMarketplace", function () {
       await projectRegistry.getAddress(), 
       owner.address
     );
-    
     // Add project as seller
     await projectRegistry.connect(seller).addProject(
       carbonRemoved,
       ipfsCID,
       uniqueVerificationId, 
     );
-
     // Approve and mint credits by auditor
     await projectRegistry.connect(owner).grantRole(
       await projectRegistry.AUDITOR_ROLE(), 
@@ -115,6 +113,24 @@ describe("CarbonCreditMarketplace", function () {
 
       marketFee = await marketplace.platformFeeBasisPoints();
       expect(marketFee).to.equal(newFee); //
+    });
+    it("Should prevent non-owner from updating platform fee", async function () {
+      await expect(
+        marketplace.connect(buyer).updatePlatformFee(150)
+      ).to.be.revertedWithCustomError;
+    });
+
+    it("Should receive ETH and update contract balance", async function () {
+      const initialBalance = await marketplace.accountBalances(marketplace.getAddress());
+      const sendAmount = ethers.parseEther("1");
+      
+      await owner.sendTransaction({
+        to: marketplace.getAddress(),
+        value: sendAmount
+      });
+    
+      const finalBalance = await marketplace.accountBalances(marketplace.getAddress());
+      expect(finalBalance).to.equal(initialBalance + sendAmount);
     });
   });
 
@@ -250,11 +266,11 @@ describe("CarbonCreditMarketplace", function () {
     });
   });
 
-  describe("Order Expiration", function() {// Create an order
+  describe("Order Expiration", function() { // Create an order
     const orderAmount = 100;
-    const pricePerCredit = ethers.parseEther("10");
+    const pricePerCredit = ethers.parseEther("0.0001");
     const orderPrice = BigInt(orderAmount) * pricePerCredit;
-    const orderId = 0; 
+    const orderId = 0;
     
     beforeEach(async function () {
       // Create sell order
@@ -263,6 +279,15 @@ describe("CarbonCreditMarketplace", function () {
         orderAmount, 
         pricePerCredit
       );
+      await marketplace.connect(seller).createSellOrder(
+        projectId, 
+        orderAmount+100, 
+        pricePerCredit
+      );
+      await owner.sendTransaction({
+        to: marketplace.getAddress(),
+        value: ethers.parseEther("0.1")
+      })
     });
     
     it("Should expire an order after 7 days and emit OrderExpired event", async function () { 
@@ -270,11 +295,11 @@ describe("CarbonCreditMarketplace", function () {
       await time.increase(7 * 24 * 60 * 60 + 1);
   
       // Check order expiration
-      const tx = await marketplace.checkOrderExpiration(orderId);
+      const tx = await marketplace.closeExpiredOrder(orderId);
   
       // Verify event emission
       await expect(tx)
-        .to.emit(marketplace, orderExpiredEvent)
+        .to.emit(marketplace, expiredOrderClosedEvent)
         .withArgs(
           orderId, 
           seller.address, 
@@ -292,13 +317,60 @@ describe("CarbonCreditMarketplace", function () {
       // Fast forward time by 7 days + 1 second
       await time.increase(7 * 24 * 60 * 60 + 1);
       // Expire order
-      await marketplace.checkOrderExpiration(orderId);
+      await marketplace.closeExpiredOrder(orderId);
 
       // Check order expiration
-      const result = await marketplace.checkOrderExpiration(orderId);
+      const result = await marketplace.closeExpiredOrder(orderId);
       const orderAfter = await marketplace.tradeOrders(orderId);
       expect(orderAfter.isActive).to.be.false;
       expect(result).to.emit(marketplace, orderNotExpiredEvent)
+    });
+
+    it("Should pay reward to caller for closing expired order", async function () {
+      // Create an order and let it expire
+      await time.increase(7 * 24 * 60 * 60 + 1);
+      
+      const initialCallerBalance = await marketplace.accountBalances(buyer.address);
+      const initialContractBalance = await marketplace.accountBalances(marketplace.getAddress());
+      
+      const closeExpiredOrderReward = await marketplace.closeExpiredOrderReward();
+      // Close expired order
+      await marketplace.connect(buyer).closeExpiredOrder(orderId);
+      
+      // Check reward was paid
+      const expectedReward = orderPrice * closeExpiredOrderReward / BigInt(10000);
+      const finalCallerBalance = await marketplace.accountBalances(buyer.address);
+      const finalContractBalance = await marketplace.accountBalances(marketplace.getAddress());
+      
+      expect(finalCallerBalance).to.equal(initialCallerBalance + expectedReward);
+      expect(finalContractBalance).to.equal(initialContractBalance - expectedReward);
+    });
+
+    it("Should batch close multiple expired orders", async function () {
+      // Create multiple orders
+      const orderIds = [];
+      for (let i = 0; i < 3; i++) {
+        await marketplace.connect(seller).createSellOrder(
+          projectId, 
+          100, 
+          ethers.parseEther("0.1")
+        );
+        orderIds.push(i);
+      }
+    
+      // Fast forward time
+      await time.increase(7 * 24 * 60 * 60 + 1);
+    
+      const initialOwnerBalance = await marketplace.accountBalances(owner.address);
+      
+      // Batch close
+      const tx = await marketplace.connect(owner).batchCloseExpiredOrders(orderIds);
+      
+      // Verify orders closed and reward paid
+      for (let orderId of orderIds) {
+        const order = await marketplace.tradeOrders(orderId);
+        expect(order.isActive).to.be.false;
+      }
     });
   });
 
@@ -320,8 +392,8 @@ describe("CarbonCreditMarketplace", function () {
       );
     });
 
-    it("Should execute a full trade successfully", async function () {
-      const initialSellerBalance = await ethers.provider.getBalance(seller.address);
+    it("Should execute a trade successfully", async function () {
+      const initialSellerBalance = await marketplace.accountBalances(seller.address);
       
       // Check event emission
       await expect(
@@ -333,7 +405,7 @@ describe("CarbonCreditMarketplace", function () {
       expect(buyerBalance).to.equal(orderAmount);
 
       // Verify seller received payment
-      const finalSellerBalance = await ethers.provider.getBalance(seller.address);
+      const finalSellerBalance = await marketplace.accountBalances(seller.address);
       const feePercentage = await marketplace.platformFeeBasisPoints();
       const sellerProceeds = orderTotalPrice - orderTotalPrice * feePercentage / BigInt(10000);
       // console.log(`Seller init balance: ${initialSellerBalance}, Sell price: ${orderTotalPrice}, proceeds: ${sellerProceeds}`);
@@ -356,4 +428,32 @@ describe("CarbonCreditMarketplace", function () {
     });
 
   });
+  describe("Withdraw account balance", function() {
+    it("Should allow user to withdraw account balance", async function () {
+      // First, add some balance to account through compliting a trade
+      await marketplace.connect(seller).createSellOrder(
+        projectId, 
+        100, 
+        ethers.parseEther("0.1")
+      );
+      await marketplace.connect(buyer).executeTrade(0, { value: ethers.parseEther("10") });
+    
+      const initialMarketplaceBalance = await marketplace.accountBalances(seller.address);
+    
+      // Withdraw
+      const withdrawAmount = initialMarketplaceBalance / 2n;
+      await marketplace.connect(seller).withdrawAccountBalance(seller.address, withdrawAmount);
+
+      const finalMarketplaceBalance = await marketplace.accountBalances(seller.address);
+    
+      expect(finalMarketplaceBalance).to.equal(initialMarketplaceBalance - withdrawAmount);
+    });
+    
+    it("Should prevent withdrawing more than account balance", async function () {
+      const excessiveAmount = (await marketplace.accountBalances(seller.address)) + 1n;
+      await expect(
+        marketplace.connect(seller).withdrawAccountBalance(seller.address, excessiveAmount)
+      ).to.be.revertedWithCustomError(marketplace, "InsufficientBalance");
+    });
+  })
 });

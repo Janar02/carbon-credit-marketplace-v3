@@ -107,7 +107,7 @@ describe("CarbonCreditToken", function() {
     it("Should revert minting more credits than issued", async function () {
       const creditsIssued = await projectRegistry.getProjectIssuedCredits(projectId);
       
-      carbonToken.connect(tokenManager).mintCredits(
+      await carbonToken.connect(tokenManager).mintCredits(
         projectOwner.address, 
         projectId, 
         creditsIssued - BigInt(2), 
